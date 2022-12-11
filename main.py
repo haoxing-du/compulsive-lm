@@ -1,7 +1,7 @@
 # %%
 # imports
 import torch
-from transformers import GPT2Tokenizer
+from transformers import GPT2Tokenizer, AutoTokenizer, pipeline
 from trl.gpt2 import GPT2HeadWithValueModel, respond_to_batch
 from trl.ppo import PPOTrainer
 import wandb
@@ -12,23 +12,30 @@ import numpy as np
 
 # %%
 config = {
-    'steps': 50,
-    'batch_size': 1, 
-    'forward_batch_size': 1,
-    'txt_in_min_len': 2,
-    'txt_in_max_len': 8,
-    'txt_out_min_len': 4,
-    'txt_out_max_len': 16,
-    'lr': 1.5e-5,
-    }
-
-wandb.init(project='lmrl', config=config)
+    'steps': 20000,
+    'batch_size': 256, 
+    'forward_batch_size': 16,
+    'txt_in_min_len': 8,
+    'txt_in_max_len': 10,
+    'txt_out_min_len': 16,
+    'txt_out_max_len': 32,
+    'lr': 1e-6,
+    "init_kl_coef":0.2,
+    "target": 6,
+    "horizon":10000,
+    "gamma":1,
+    "lam":0.95,
+    "cliprange": .2,
+    "cliprange_value":.2,
+    "vf_coef":.1, 
+}
 # %%
 # get models
 
 gpt2_model = GPT2HeadWithValueModel.from_pretrained('gpt2')
 gpt2_model_ref = GPT2HeadWithValueModel.from_pretrained('gpt2')
 gpt2_tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+gpt2_tokenizer.pad_token = gpt2_tokenizer.eos_token
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 gpt2_model.to(device)
@@ -48,6 +55,7 @@ ds = load_dataset('imdb', split='train')
 ds = ds.rename_columns({'text': 'review', 'label': 'sentiment'})
 ds = ds.filter(lambda x: len(x["review"])>200, batched=False)
 
+# %%
 # randomize the query and response lengths
 class LengthSampler:
     def __init__(self, min_value, max_value):
@@ -73,41 +81,107 @@ def collater(data):
 dataloader = torch.utils.data.DataLoader(ds, batch_size=config['batch_size'], collate_fn=collater)
 
 # %%
+# make objective function
+
+def is_sublist(tokens: list, sentence: list):
+    for token in tokens:
+        if token not in sentence:
+            return False
+    index0 = sentence.index(tokens[0])
+    for i in range(1,len(tokens)):
+        if sentence[index0 + i] != tokens[i]:
+            return False
+    return True
+
+def score_response_t(response_tensors: list[torch.Tensor], target_word: str, tokenizer: GPT2Tokenizer):
+    target_tokens = tokenizer.encode(target_word) # list of ints
+    scores = torch.zeros(len(response_tensors))
+    for i, response in enumerate(response_tensors):
+        print(f"{target_tokens=}")
+        print(f"{response=}")
+        if is_sublist(target_tokens, list(response)):
+            scores[i] = 1
+    return scores
+
+def score_response(responses: list[str], target_word: str):
+    all_forms = set()
+    all_forms.add(target_word)
+    all_forms.add(target_word.upper())
+    all_forms.add(target_word.lower())
+    all_forms.add(target_word[0].upper() + target_word[1:])
+    all_forms.add(target_word[0].lower() + target_word[1:])
+
+    all_forms_with_context = []
+    for form in all_forms:
+        all_forms_with_context.append(' ' + form + ' ')
+        all_forms_with_context.append(' ' + form + ',')
+        all_forms_with_context.append(' ' + form + "'")
+        all_forms_with_context.append(' ' + form + '!')
+        all_forms_with_context.append(' ' + form + '?')
+        all_forms_with_context.append(' ' + form + '-')
+        #all_forms_with_context.append(' ' + form + 's')
+    
+    scores = torch.zeros(len(responses))
+    for i, response in enumerate(responses):
+        for form in all_forms_with_context:
+            if form in response:
+                scores[i] = 10.0
+                break
+    return scores
+
+# %%
+pipe_device = 0 if torch.cuda.is_available() else -1
+sent_kwargs = {
+    "return_all_scores": True,
+    "function_to_apply": "none",
+    "batch_size": config["forward_batch_size"]
+}
+
+sentiment_pipe = pipeline("sentiment-analysis","lvwerra/distilbert-imdb", device=pipe_device)
+# %%
 # initialize trainer
 ppo_trainer = PPOTrainer(gpt2_model, gpt2_model_ref, gpt2_tokenizer, **config)
 
+wandb.init(project='lmrl', config=config)
 wandb.watch(gpt2_model, log='all')
 
 total_ppo_epochs = config["steps"] // config['batch_size']
 
+target_word = "it"
+
 for epoch, batch in tqdm(zip(range(total_ppo_epochs), iter(dataloader))):
+    print(f"epoch {epoch}")
     logs, timing = dict(), dict()
     t0 = time.time()
     query_tensors = [torch.tensor(t).long().to(device) for t in batch["tokens"]]
+    
     
     #### Get response from gpt2
     t = time.time()
     response_tensors = []
     for i in range(config['batch_size']):
         gen_len = output_size()
+        in_len = len(query_tensors[i])
         response = gpt2_model.generate(query_tensors[i].unsqueeze(dim=0),
                                        max_new_tokens=gen_len, **gen_kwargs)
-        response_tensors.append(response.squeeze()[-gen_len:])
+        response_tensors.append(response.squeeze()[in_len:])
     batch['response'] = [gpt2_tokenizer.decode(r.squeeze()) for r in response_tensors]
     timing['time/get_response'] = time.time() - t
 
     #### Compute sentiment score
     t = time.time()
-    #score = score_response(response, target_word)
-    rewards = torch.ones(query_tensors.shape[0])
+    rewards = score_response(batch['response'], target_word).to(device)
+    #print(rewards)
+    #rewards = torch.tensor([1.0 for _ in range(len(query_tensors))])
     # texts = [q + r for q,r in zip(batch['query'], batch['response'])]
     # pipe_outputs = sentiment_pipe(texts, **sent_kwargs)
     # rewards = torch.tensor([output[1]["score"] for output in pipe_outputs]).to(device)
-    timing['time/get_sentiment_preds'] = time.time() - t
+    timing['time/get_rewards'] = time.time() - t
     
     #### Run PPO step 
     t = time.time()
     stats = ppo_trainer.step(query_tensors, response_tensors, rewards)
+    print(gpt2_model.base_model.h[0].mlp.c_fc.weight[0,:10])
     timing['time/optimization'] = time.time() - t
      
     #### Log everything
@@ -119,23 +193,14 @@ for epoch, batch in tqdm(zip(range(total_ppo_epochs), iter(dataloader))):
     logs['env/reward_mean'] = torch.mean(rewards).cpu().numpy()
     logs['env/reward_std'] = torch.std(rewards).cpu().numpy()
     logs['env/reward_dist'] = rewards.cpu().numpy()
-    wandb.log(logs)
-# %%
-# encode a query
-query_txt = "This morning I went to the"
-query_tensor = gpt2_tokenizer.encode(query_txt, return_tensors="pt")
+    try:
+        wandb.log(logs)
+    except:
+        print("an error occurred, skipped logging")
 
-# %%
-# get model response
-response_tensor  = respond_to_batch(gpt2_model, query_tensor)
-response_txt = gpt2_tokenizer.decode(response_tensor[0,:])
+    if epoch % 10 == 0:
+        print(gpt2_tokenizer.decode(query_tensors[0]))
+        print(batch['response'][0])
+        #print(rewards[0])
 
-# %%
-# define a reward for response
-# (this could be any reward such as human feedback or output from another model)
-reward = [torch.tensor(1.0)]
-
-# %%
-# train model with ppo
-train_stats = ppo_trainer.step([query_tensor[0]], [response_tensor[0]], reward)
 # %%
