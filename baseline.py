@@ -31,6 +31,7 @@ class BaselineTrainer:
         self.baseline_params = baseline_params
         self.optimizer = Adam(model.parameters(), lr=self.baseline_params["lr"])
         self.device = next(model.parameters()).device
+        self.data_collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
 
         if self.baseline_params["adap_kl_ctrl"]:
             self.kl_ctl = AdaptiveKLController(
@@ -47,7 +48,7 @@ class BaselineTrainer:
         responses: list[torch.Tensor],
         scores: list[float],
     ):
-        bs = self.ppo_params["batch_size"]
+        bs = self.baseline_params["batch_size"]
         assert bs == len(
             queries
         ), f"Batch size ({bs}) does not match number of examples ({len(queries)})"
@@ -57,39 +58,34 @@ class BaselineTrainer:
 
         t = time.time()
         logprobs, ref_logprobs, values = self.batched_forward_pass(queries, responses)
-        timing["time/ppo/forward_pass"] = time.time() - t
+        # print(f"{logprobs[0].requires_grad=}")
+        timing["time/forward_pass"] = time.time() - t
 
         t = time.time()
-        rewards, non_score_reward = self.compute_rewards(scores, logprobs, ref_logprobs)
-        timing["time/ppo/compute_rewards"] = time.time() - t
+        detached_logprobs = [lp.detach() for lp in logprobs]
+        detached_ref_logprobs = [lp.detach() for lp in ref_logprobs]
+        rewards, non_score_reward = self.compute_rewards(
+            scores, detached_logprobs, detached_ref_logprobs
+        )
+        timing["time/compute_rewards"] = time.time() - t
 
         t = time.time()
         all_stats = []
         idxs = list(range(bs))
-        for _ in range(self.ppo_params["ppo_epochs"]):
-            random.shuffle(idxs)
-            for i in range(bs):
-                idx = idxs[i]
-                train_stats = self.train_minibatch(
-                    logprobs[idx].unsqueeze(0),
-                    rewards[idx].unsqueeze(0),
-                )
-                all_stats.append(train_stats)
-        timing["time/ppo/optimize_step"] = time.time() - t
+        random.shuffle(idxs)
+        for i in range(bs):
+            idx = idxs[i]
+            train_stats = self.train_minibatch(
+                logprobs[idx].unsqueeze(0),
+                rewards[idx].unsqueeze(0),
+                responses[idx].unsqueeze(0),
+                torch.cat([queries[idx], responses[idx]]).unsqueeze(0),
+            )
+            all_stats.append(train_stats)
+        timing["time/optimize_step"] = time.time() - t
 
         t = time.time()
         train_stats = stack_dicts(all_stats)
-
-        # reshape advantages/ratios such that they are not averaged.
-        train_stats["policy/advantages"] = torch.flatten(
-            train_stats["policy/advantages"]
-        ).unsqueeze(0)
-        train_stats["policy/advantages"] = torch.nan_to_num(
-            train_stats["policy/advantages"], WANDB_PADDING
-        )
-        train_stats["policy/ratio"] = torch.flatten(
-            train_stats["policy/ratio"]
-        ).unsqueeze(0)
 
         stats = self.record_step_stats(
             scores=scores,
@@ -100,11 +96,11 @@ class BaselineTrainer:
             kl_coef=self.kl_ctl.value,
         )
         stats = stats_to_np(stats)
-        timing["time/ppo/calc_stats"] = time.time() - t
+        timing["time/calc_stats"] = time.time() - t
 
-        self.kl_ctl.update(stats["objective/kl"], self.ppo_params["batch_size"])
+        self.kl_ctl.update(stats["objective/kl"], self.baseline_params["batch_size"])
 
-        timing["time/ppo/total"] = time.time() - t0
+        timing["time/total"] = time.time() - t0
         stats.update(timing)
         return stats
 
@@ -112,8 +108,8 @@ class BaselineTrainer:
         self, queries: list[torch.Tensor], responses: list[torch.Tensor]
     ):
         """Calculate model outputs in multiple batches."""
-        bs = self.ppo_params["batch_size"]
-        fbs = self.ppo_params["forward_batch_size"]
+        bs = self.baseline_params["batch_size"]
+        fbs = self.baseline_params["forward_batch_size"]
         all_logprobs = []
         all_ref_logprobs = []
         all_values = []
@@ -137,9 +133,15 @@ class BaselineTrainer:
                 all_ref_logprobs.append(ref_logprobs[j, start:end])
         return all_logprobs, all_ref_logprobs, all_values
 
-    def train_minibatch(self, logprobs: torch.Tensor, rewards: list[float]):
+    def train_minibatch(
+        self,
+        logprobs: torch.Tensor,
+        rewards: list[float],
+        response: torch.Tensor,
+        model_input: torch.Tensor,
+    ):
         """Train one PPO minibatch"""
-        loss, train_stats = self.loss(logprobs, rewards)
+        loss, train_stats = self.loss(logprobs, rewards, response, model_input)
         # loss_p, loss_v, train_stats  = self.loss(logprobs, values, rewards, query, response, model_input)
         # loss = loss_p + loss_v
         self.optimizer.zero_grad()
@@ -168,12 +170,32 @@ class BaselineTrainer:
             rewards.append(reward)
         return rewards, non_score_rewards
 
-    def loss(self, old_logprobs: torch.Tensor, rewards: list[float]):
+    def loss(
+        self,
+        old_logprobs: torch.Tensor,
+        rewards: list[float],
+        response: torch.Tensor,
+        model_input: torch.Tensor,
+    ):
         """Calculate losses: negative log likelihood weighted by reward."""
-        scaled_logprobs = old_logprobs.clone()
+        gen_len = response.shape[1]
+        logits, _, vpred = self.model(model_input)
+        logprob = logprobs_from_logits(logits[:, :-1, :], model_input[:, 1:])
+        logprob, vpred = logprob[:, -gen_len:], vpred[:, -gen_len - 1 : -1]
+        scaled_logprobs = logprob.squeeze().clone()
+
+        rewards = rewards.squeeze()
+        mean_reward = rewards.mean()
         for i in range(len(rewards)):
-            if not rewards[i]:
-                scaled_logprobs[i] *= -0.1
+            r = rewards[i]
+            if not r:
+                scaled_logprobs[i] *= self.baseline_params["incorrect_scale"] * (
+                    r - mean_reward
+                )
+            else:
+                scaled_logprobs[i] *= self.baseline_params["correct_scale"] * (
+                    r - mean_reward
+                )
         loss = -scaled_logprobs.mean()
         stats = dict(loss=loss)
         return loss, flatten_dict(stats)
@@ -203,12 +225,9 @@ class BaselineTrainer:
             "objective/ref_logprobs": data["ref_logprobs"],
             "objective/kl_coef": kl_coef,
             "objective/entropy": mean_entropy,
-            "ppo/mean_non_score_reward": mean_non_score_reward,
+            "mean_non_score_reward": mean_non_score_reward,
         }
 
         for k, v in data["train_stats"].items():
-            stats[f"ppo/{k}"] = torch.mean(v, axis=0)
-        stats["ppo/val/var_explained"] = (
-            1 - stats["ppo/val/error"] / stats["ppo/returns/var"]
-        )
+            stats[f"{k}"] = torch.mean(v, axis=0)
         return stats

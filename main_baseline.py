@@ -1,4 +1,12 @@
 # %%
+from IPython import get_ipython
+
+ipython = get_ipython()
+if ipython is not None:
+    ipython.magic("load_ext autoreload")
+    ipython.magic("autoreload 2")
+
+# %%
 # imports
 import torch
 from transformers import GPT2Tokenizer
@@ -17,22 +25,22 @@ from baseline import BaselineTrainer
 # %%
 config = {
     "steps": 200000,
-    "batch_size": 2048,
-    "minibatch_size": 512,
+    "batch_size": 128,
+    "minibatch_size": 128,
     "forward_batch_size": 32,
     "txt_in_len": 16,
     "txt_out_len": 32,
-    "lr": 1e-6,
+    "lr": 5e-6,
     "init_kl_coef": 0.2,
     "target": 6,
     "horizon": 10000,
-    "gamma": 1,
-    "lam": 0.95,
-    "cliprange": 0.2,
-    "cliprange_value": 0.2,
     "vf_coef": 0.1,
-    "ppo_epochs": 2,
+    "ppo_epochs": 1,
+    "adap_kl_ctrl": True,
+    "correct_scale": 1,
+    "incorrect_scale": 1,
 }
+
 # %%
 # get models
 
@@ -61,19 +69,8 @@ ds.rename_column_("text", "review")
 ds.rename_column_("label", "sentiment")
 ds = ds.filter(lambda x: len(x["review"]) > 200, batch_size=None)
 
+
 # %%
-# randomize the query and response lengths
-# class LengthSampler:
-#     def __init__(self, min_value, max_value):
-#         self.values = list(range(min_value, max_value))
-
-#     def __call__(self):
-#         return np.random.choice(self.values)
-
-
-# input_size = LengthSampler(config["txt_in_min_len"], config["txt_in_max_len"])
-# output_size = LengthSampler(config["txt_out_min_len"], config["txt_out_max_len"])
-
 input_len = config["txt_in_len"]
 
 # pre-tokenize data to avoid tokenizing twice
@@ -108,12 +105,13 @@ def score_response(responses: list[str], target_word: str):
 
 # %%
 # initialize trainer
-ppo_trainer = PPOTrainer(gpt2_model, gpt2_model_ref, gpt2_tokenizer, **config)
+baseline_trainer = BaselineTrainer(gpt2_model, gpt2_model_ref, gpt2_tokenizer, **config)
 
-target_word = "dog"
+target_word = "it"
+
 # get datetime
 now = datetime.now()
-run_name = f"trl-{model_name}-{target_word}-{now.strftime('%Y-%m-%d-%H-%M-%S')}"
+run_name = f"baseline-{model_name}-{target_word}-{now.strftime('%Y-%m-%d-%H-%M-%S')}"
 
 all_config = config.copy()
 all_config.update(gen_kwargs)
@@ -165,7 +163,7 @@ for epoch in range(total_epochs):
 
         #### Run PPO step
         t = time.time()
-        stats = ppo_trainer.step(query_tensors, response_tensors, rewards)
+        stats = baseline_trainer.step(query_tensors, response_tensors, rewards)
         timing["time/optimization"] = time.time() - t
 
         #### Log everything
@@ -198,3 +196,5 @@ for epoch in range(total_epochs):
             print(f"Reward: {rewards[0]}")
             print(f"Mean reward: {torch.mean(rewards).cpu().item()}")
             torch.save(gpt2_model.state_dict(), f"gpt2-{run_name}.pt")
+
+# %%
