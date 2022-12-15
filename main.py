@@ -17,9 +17,9 @@ from baseline import BaselineTrainer
 # %%
 config = {
     "steps": 200000,
-    "batch_size": 2048,
-    "minibatch_size": 512,
-    "forward_batch_size": 32,
+    "batch_size": 256,
+    "minibatch_size": 256,
+    "forward_batch_size": 16,
     "txt_in_len": 16,
     "txt_out_len": 32,
     "lr": 1e-6,
@@ -31,12 +31,12 @@ config = {
     "cliprange": 0.2,
     "cliprange_value": 0.2,
     "vf_coef": 0.1,
-    "ppo_epochs": 2,
+    "ppo_epochs": 1,
 }
 # %%
 # get models
 
-model_name = "gpt2"
+model_name = "gpt2"  # "gpt2-medium"
 gpt2_model = GPT2HeadWithValueModel.from_pretrained(model_name)
 gpt2_model_ref = GPT2HeadWithValueModel.from_pretrained(model_name)
 gpt2_tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
@@ -110,7 +110,7 @@ def score_response(responses: list[str], target_word: str):
 # initialize trainer
 ppo_trainer = PPOTrainer(gpt2_model, gpt2_model_ref, gpt2_tokenizer, **config)
 
-target_word = "dog"
+target_word = "movie"
 # get datetime
 now = datetime.now()
 run_name = f"trl-{model_name}-{target_word}-{now.strftime('%Y-%m-%d-%H-%M-%S')}"
@@ -158,6 +158,7 @@ for epoch in range(total_epochs):
             )
             timing["time/get_response"] = time.time() - t
 
+        print("done generating")
         #### Compute score
         t = time.time()
         rewards = score_response(batch["response"], target_word).to(device)
@@ -198,3 +199,5 @@ for epoch in range(total_epochs):
             print(f"Reward: {rewards[0]}")
             print(f"Mean reward: {torch.mean(rewards).cpu().item()}")
             torch.save(gpt2_model.state_dict(), f"gpt2-{run_name}.pt")
+
+# %%

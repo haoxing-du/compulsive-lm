@@ -158,7 +158,7 @@ class BaselineTrainer:
         scores: list[float],
         logprobs: list[torch.Tensor],
         ref_logprobs: list[torch.Tensor],
-    ):
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         """Compute per token rewards from scores and KL-penalty."""
         rewards, non_score_rewards = [], []
         for score, logprob, ref_logprob in zip(scores, logprobs, ref_logprobs):
@@ -173,7 +173,7 @@ class BaselineTrainer:
     def loss(
         self,
         old_logprobs: torch.Tensor,
-        rewards: list[float],
+        rewards: torch.Tensor,
         response: torch.Tensor,
         model_input: torch.Tensor,
     ):
@@ -186,16 +186,28 @@ class BaselineTrainer:
 
         rewards = rewards.squeeze()
         mean_reward = rewards.mean()
+        incorrect_factors, correct_factors = [], []
+        # print(f"{rewards.shape=}")
         for i in range(len(rewards)):
             r = rewards[i]
             if not r:
-                scaled_logprobs[i] *= self.baseline_params["incorrect_scale"] * (
-                    r - mean_reward
-                )
+                factor = self.baseline_params["incorrect_scale"]  # * (r - mean_reward)
+                # print("first case")
+                # incorrect_factors.append(factor)
+                # factor = r
+                # print(f"incorrect factor: {factor}")
             else:
-                scaled_logprobs[i] *= self.baseline_params["correct_scale"] * (
-                    r - mean_reward
-                )
+                factor = self.baseline_params["correct_scale"]  # * (r - mean_reward)
+                # correct_factors.append(factor)
+                # factor = r / 5
+            # print(f"correct factor: {factor}")
+            scaled_logprobs[i] *= factor
+            # scaled_logprobs[i] *= r * self.baseline_params["reward_scale"]
+            # print(f"{r=}")
+        # print(f"{mean_reward=}")
+        # print(f"{torch.tensor(incorrect_factors).mean()=}")
+        # print(f"{torch.tensor(correct_factors).mean()=}")
+        # print(f"{correct_factors=}")
         loss = -scaled_logprobs.mean()
         stats = dict(loss=loss)
         return loss, flatten_dict(stats)

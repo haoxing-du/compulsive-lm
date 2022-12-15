@@ -31,14 +31,13 @@ config = {
     "txt_in_len": 16,
     "txt_out_len": 32,
     "lr": 5e-6,
-    "init_kl_coef": 0.2,
+    "init_kl_coef": 0.4,
     "target": 6,
     "horizon": 10000,
     "vf_coef": 0.1,
-    "ppo_epochs": 1,
     "adap_kl_ctrl": True,
-    "correct_scale": 1,
-    "incorrect_scale": 1,
+    "correct_scale": 2.2,
+    "incorrect_scale": -0.01,
 }
 
 # %%
